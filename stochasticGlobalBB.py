@@ -1,181 +1,246 @@
 import numpy as np
 from stochastic_val import stochastic_valuations
 from profit import profit
-from regret import regret
+from regret import regret, cum_regrets
 import matplotlib.pyplot as plt
+import scipy.stats as stats
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
 
-np.random.seed(10)
+np.random.seed(11)
 
-# Only for bandit feedback
-class UCB_globalBB:
-    def __init__(self, p_b, p_s, initial_budget = 0, exploration_probability = 0.2, p_decay = 0.95, exploration_scaling = 1):
-        
-        self.budget = initial_budget
-        self.p_b = p_b # buyer's prices, ndarray
-        self.p_s = p_s # seller's prices
-        self.n_b = len(self.p_b)
-        self.n_s = len(self.p_s)
-        
-        self.price_grid = np.array([(p_b[i], p_s[j]) for i in range(self.n_b) for j in range(self.n_s) if p_b[i]>=p_s[j]]) 
-        self.b = np.zeros(self.n_b) # attempt to make some use of side information; can be adapted
-        # probabilities that the current valuations is a corresponding element of p_b?
-        self.s = np.zeros(self.n_s)
-        
-        self.nActions = len(self.price_grid)
-        self.Q = np.zeros(self.nActions)
-        self.rewards = np.zeros(self.nActions)
-        self.N = np.zeros(self.nActions)  
+
+
+
+# standard UCB - functional for 1-bit feedback, stochastic setting and weak BB
+# ucb with side information allows to incorporate the estimations of probabilities
+# Bernouilli, based on variables (valuations) which themselves follow beta
+# distribution, so they can be represented by CDF however parameters of beta
+# distributions are not known; these probability estimations are estimations
+# of Q using a different approach; Q estimated throughout the algo and these
+# expected profits through moves violating the global budget balance
+# Modified part is action selection, which also depends on expected profit
+# estimated using other method with 2-bit feedback
+
+class UCB_side_info:
+    def __init__(self, nActions, c):
+        self.nActions = nActions
+        self.Q = np.zeros(nActions)  
+        self.X = np.zeros(nActions) 
+        self.N = np.zeros(nActions)  
         self.t = 0  
-        self.action = None # defined as price pairs
-        self.action_idx = None
-        self.p = exploration_probability
-        self.exploration = False 
-        self.c = exploration_scaling
-        self.p_decay = p_decay
-        self.acc_profit = []
-        
+        self.action = None
+        self.c = c
 
-    def nextAction(self):
-        self.t += 1 
-        if np.random.rand() < self.p: 
-            # print("exploration move")
-            # To get 2-bit feedback (but at some cost)
-            self.exploration = True
-            buyer_explore = np.random.choice([True, False])
-            if buyer_explore: 
-                allowed_idx = np.where(self.p_b >= 1 - self.budget)[0] 
-                idx = np.random.choice(allowed_idx)
-                self.action = (self.p_b[idx], 1)
-            else:
-                allowed_idx = np.where(self.p_s <= self.budget)[0]
-                idx = np.random.choice(allowed_idx)
-                self.action = (0, self.p_s[idx])
-            # self.p /= np.log(self.t + 1) # logarithmic decay of exporation probability
-            self.p *= self.p_decay
+    def nextAction(self, expected_profits):
+        self.t += 1
+        if np.min(self.N) == 0:
+            self.action = np.argmin(self.N)
+            
         else:
-            self.exploration = False
-            b_sum=np.sum(self.b)
-            s_sum=np.sum(self.s)
-
-            weighted_potential_reward = np.array([self.b[i]/max(b_sum, 1) * self.p_b[i] - self.s[j]/max(s_sum, 1) * self.p_s[j] for i in range(self.n_b) for j in range(self.n_s) if self.p_b[i]>=self.p_s[j]]) 
-            # print(weighted_potential_reward)
-            ucb_values_mod = self.c * weighted_potential_reward + self.Q + np.sqrt((2 * np.log(self.t)) / (self.N + 1e-5)) 
-            # print(ucb_values_mod)
-            # ucb_max = np.max(ucb_values_mod)
-            self.action_idx = np.argmax(ucb_values_mod)
-            self.action = self.price_grid[self.action_idx] 
+            ucb_values = self.Q + self.c * np.sqrt((2 * np.log(self.t)) / self.N) 
+            # The only difference from the standard UCB is the inclusion of
+            # expected_profits estimated in an alternative way in the action
+            # selection. Q and expected_profits should converge in the long run.
+            self.action = np.argmax(ucb_values + expected_profits)
+        
         return self.action
 
-    def observeReward(self, profit): 
-        self.budget += profit
-        p_b, p_s = self.action
-        if self.exploration is True: 
-            if p_s==1:
-                if profit < 0: 
-                    self.b[self.b >= p_b] += 1
-                else: 
-                    self.b[self.b<p_b] += 1
-            else:
-                if profit < 0: 
-                    self.s[self.s<=p_s] += 1
-                else: 
-                    self.s[self.s>p_s] += 1
-        else: 
-             self.rewards[self.action_idx]+= profit
-             self.N[self.action_idx]+= 1
-             self.Q[self.action_idx]= self.rewards[self.action_idx]/self.N[self.action_idx]
-        self.acc_profit.append(profit + (self.acc_profit[-1] if self.acc_profit else 0.0))
-    
-            
+    def observeReward(self, profit):
+        self.X[self.action] += profit
+        self.N[self.action]+= 1
+        self.Q[self.action]= self.X[self.action]/self.N[self.action]
+
 
     def reset(self):
-        # self.budget = initial_budget
-        self.b = np.zeros(self.n_b)
-        self.s = np.zeros(self.n_s)
         self.Q = np.zeros(self.nActions)
-        self.rewards = np.zeros(self.nActions)
+        self.X = np.zeros(self.nActions)
         self.N = np.zeros(self.nActions)
         self.t = 0
         self.action = None
-        self.action_idx = None
-        self.exploration = False 
-        self.acc_profit = []
+        # self.acc_profit = []
 
-    def results(self):
-        return self.acc_profit
-    
-    
-    
-    
-T = 10000 # adjust to more
-discret = 100
-prices_b = np.linspace(0, 1, discret)
+    # def results(self):
+        # return self.acc_profit
+
+
+
+
+
+T = 10000
+discret = 20
+prices_b = np.linspace(0, 1, discret) 
 prices_s = np.linspace(0, 1, discret)
-algo = UCB_globalBB(prices_b, prices_s) 
+# Weakly budget balanced price grid (standard actions), passed to UCB
+price_grid = np.array([(p1, p2) for p1 in prices_b for p2 in prices_s if p1 >= p2])
+K = len(price_grid) 
+c = 0.1 
+algo = UCB_side_info(K, c)
 
-profits = [] # can be recreated from algo.acc_profits
+profits = []
 regrets = []
-valuations = []
+valuations = [] 
 
+# Additional parts - for global budget balanced exploratory moves
+budget = 0 # initial budget, it must not go below 0 in any round
+exploration_prob = 0.7 # initial probability of playing an exploratory move
+prob_decay = 0.95 # decay of probability of playing loss-incurring actions 
+
+# Vectors with estimated beta distributions to model the uncertain probabilities
+# of acceptance by the buyer and the seller for given buyer's and seller's
+# prices, respectively. Initialization with uninformative prior, corresponding
+# to uniform distribution.
+
+# Estimated beta distribution parameters for buyer's prices
+beta_params_b = np.array([[1, 1] for i in range(discret)])
+# Estimated beta distribution parameters for seller's prices
+beta_params_s = np.array([[1, 1] for i in range(discret)])
+
+# Expected profits for price pairs from the price grid given the estimations
+# of their acceptance probabilities (best guesses of these probabilities are
+# expected values of corresponding estimated beta distributions).
+
+# Initialization of expected profits given uninformative priors - with
+# expected value of 1/2 for each probability of acceptance.
+expected_profits = np.array([(p[0]-p[1]) * 1/2 * 1/2 for p in price_grid])
 
 for t in range(T):
     b_t, s_t = stochastic_valuations(5, 2, 2, 5) 
-    # print(b_t, s_t)
     valuations.append((b_t, s_t))
-    p_b_t, p_s_t = algo.nextAction() 
-    # print(p_b_t, p_s_t)
     
-    curr_profit = profit(p_b_t, p_s_t, b_t, s_t) 
-    # print(curr_profit)
+    # Play a loss-incurring exploratory action with exploration probability
+    if np.random.rand() < exploration_prob: 
+        # There is always possibility to post (0, 0) and (1, 1) respecting budget
+        # so the set of valid variable prices is not empty.
+        
+        # 4 distinct scenarios and distinct updates to estimated beta distributions
+        # and to estimated profits: buyer's side explored & buyer accepts,
+        # buyer's side explored & buyer rejects, seller's side explored & seller
+        # accepts, seller's side explored & seller rejects
+        
+        algo.t += 1 # increment externally - only one action gets executed at
+        # a given time step, this action happens outside of the algorithm 
+        # technically (on the implementation side) but conceptually it is 
+        # selected by our regret minimizer so is treated as an action
+        exploration_prob *= prob_decay # as a loss-incurring action is played
+        # the probability of playing a loss-incurring action in the next round
+        # decays
+        
+        # Explore buyer's or seller's side with equal probability
+        buyer_explore = np.random.choice([True, False])
+        if buyer_explore:
+            # Indices of buyer's prices respecting global budget balance
+            valid_idx = np.where(prices_b>=1-budget)[0]
+            
+            # Indices (with respect to valid_idx array, which itself stores 
+            # indices with respect to arrays prices_b and beta_params_b) of the 
+            # less explored prices (the ones whose distributions were updated 
+            # fewer times, whose sum of beta distribution parameters is the 
+            # smallest) from the ones present in valid_idx array i.e. among the 
+            # ones allowed given the global budget balance constraint.
+            less_explored = np.where(np.sum(beta_params_b[valid_idx, :], axis=1)==
+                                     np.min(np.sum(beta_params_b[valid_idx, :], axis=1)))[0]
+            # Transforming indices with respect to valid_idx array to indices
+            # with respect to prices_b array (original point of reference)
+            indices = valid_idx[less_explored] 
+            # Random choice of a price to explore from the ones allowed by
+            # the global budget balance and from the ones less explored
+            idx = np.random.choice(indices)
+            p_b = prices_b[idx]
+            curr_profit = profit(p_b, 1, b_t, s_t)
+            if curr_profit != 0: # if trade happened, update alpha parameters
+            # of distributions of p_b and lower prices (if trade accepted for 
+            # p_b, it will also be accepted for prices lower than p_b)
+                beta_params_b[:idx+1, 0] += 1
+            else: # trade did not happen as the price was too high for the 
+            # buyer so also higher prices would not be accepted - update beta
+            # parameters of distributions of prices greater or equal to p_b
+                beta_params_b[idx:, 1] += 1   
+        else: # explore seller's side - similar logic respecting global budget
+        # balance and encouraging less explored actions, adjusted for the seller
+            valid_idx = np.where(prices_s<=budget)[0] 
+            less_explored = np.where(np.sum(beta_params_s[valid_idx, :], axis=1)
+                                     ==np.min(np.sum(beta_params_s[valid_idx, :], axis=1)))[0]
+            indices = valid_idx[less_explored]
+            idx = np.random.choice(indices)
+            p_s = prices_s[idx]
+            curr_profit = profit(0, p_s, b_t, s_t)
+            
+            if curr_profit != 0: # if seller accepted
+                beta_params_s[idx:, 0] += 1 # if a seller accepted p_s, they 
+                # will also accepted prices higher than p_s - update alphas
+            else:
+                beta_params_s[:idx+1, 1] += 1 # update betas
+    
+        # Expected profits: product of the potential profit of a price pair
+        # and the estimated probabilities of acceptance of individual prices.
+        # Estimated probabilities are expected values of corresponding beta
+        # distributions used to model uncertainty of acceptance probabilities.
+        # Mapping between prices and indices given discretization level:
+        # p_i=i/(discret-1)  so i=p_i*(discret-1)
+        expected_profits = np.array([(p[0]-p[1]) * (beta_params_b[int((discret-1)*p[0])][0]/
+            (beta_params_b[int((discret-1)*p[0])][0] + beta_params_b[int((discret-1)*p[0])][1])) * 
+            (beta_params_s[int((discret-1)*p[1])][0]/ (beta_params_s[int((discret-1)*p[1])][0] + 
+                                  beta_params_s[int((discret-1)*p[1])][1])) for p in price_grid])
+    
+    else: # standard UCB action
+        action_idx = algo.nextAction(expected_profits)
+        p_b_t, p_s_t = price_grid[action_idx]
+        curr_profit = profit(p_b_t, p_s_t, b_t, s_t) 
+        algo.observeReward(curr_profit)
+    
+    budget += curr_profit
     profits.append(curr_profit)
-    algo.observeReward(curr_profit)
-    
-    curr_regret = regret(valuations, algo.price_grid, profits) 
+    curr_regret = regret(valuations, price_grid, profits) 
     regrets.append(curr_regret) 
-
+ 
 profits = np.array(profits)
+acc_profits = np.cumsum(profits)
 regrets = np.array(regrets)
 
-acc_profits = np.array(algo.results())
-loss_idx = np.where(np.array(profits)<0)[0]
-# print(loss_idx)
-losses = np.zeros(len(profits))
-if loss_idx.size > 0:
-    # print(loss_idx)
-    losses[loss_idx] = profits[loss_idx]
-    
-    
-# Plots
-fig, axs = plt.subplots(2, 2, figsize=(12, 10))
 
-# First plot: Regret Over Time
-axs[0, 0].plot(regrets, label='Regret')
-axs[0, 0].set_xlabel('Round')
-axs[0, 0].set_ylabel('Value')
-axs[0, 0].legend()
-axs[0, 0].set_title('Regret Over Time')
+
+# Plots
+fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+
+# First plot: Regret Over Time and fitted linear and sublinear functions
+
+## Fit a linear Function (y = a * t + b)
+rounds = np.arange(1, T+1) 
+linear_model = LinearRegression()
+linear_model.fit(rounds.reshape(-1, 1), regrets)  
+regret_linear_fit = linear_model.predict(rounds.reshape(-1, 1)) 
+
+## Fit a sublinear (t^(2/3)) function (y = a * t^(2/3) + b)
+transformed_rounds1 = rounds ** (2/3)  # Transform rounds into t^(2/3)
+sublinear_23_model = LinearRegression()
+sublinear_23_model.fit(transformed_rounds1.reshape(-1, 1), regrets)  
+regret_sublinear_23_fit = sublinear_23_model.predict(transformed_rounds1.reshape(-1, 1))
+
+## Fit a sublinear (sqrt(t)) function (y = a * t^(1/2) + b)
+transformed_rounds2 = rounds ** (1/2)  # Transform rounds into t^(2/3)
+sublinear_12_model = LinearRegression()
+sublinear_12_model.fit(transformed_rounds2.reshape(-1, 1), regrets)  
+regret_sublinear_12_fit = sublinear_12_model.predict(transformed_rounds2.reshape(-1, 1))
+
+## Plot the original regret, linear fit, t^(1/2) fit and t^(2/3) fit
+
+axs[0].plot(rounds, regrets, label='Regret', color='blue')  # Original regret curve
+axs[0].plot(rounds, regret_linear_fit, label='Linear Fit', linestyle='--', color='red')  # Linear fit
+axs[0].plot(rounds, regret_sublinear_23_fit, label=r'Sublinear Fit $t^{2/3}$', linestyle='--', color='green')  # t^(2/3) fit
+axs[0].plot(rounds, regret_sublinear_12_fit, label=r'Sublinear Fit $t^{1/2}$', linestyle='--', color='yellow')  # t^(1/2) fit
+# axs[0].plot(regrets, label='Regret')
+axs[0].set_xlabel('Round')
+axs[0].set_ylabel('Value')
+axs[0].legend()
+axs[0].set_title('Regret Over Time with Linear and Sublinear Fits')
 
 # Second plot: Accumulated Loss Over Time
-axs[0, 1].plot(losses, label='Losses - explorative actions')
-axs[0, 1].set_xlabel('Round')
-axs[0, 1].set_ylabel('Value')
-axs[0, 1].legend()
-axs[0, 1].set_title('Loss from Exploration Over Time')
-
-# Third plot: Accumulated Profit Over Time
-axs[1, 0].plot(acc_profits, label='Cumulative Profit')
-axs[1, 0].set_xlabel('Round')
-axs[1, 0].set_ylabel('Value')
-axs[1, 0].legend()
-axs[1, 0].set_title('Accumulated Profit Over Time')
-
-
-# Fourth plot: Profit Over Time
-axs[1, 1].plot(profits, label='Profit')
-axs[1, 1].set_xlabel('Round')
-axs[1, 1].set_ylabel('Value')
-axs[1, 1].legend()
-axs[1, 1].set_title('Profit Over Time')
+axs[1].plot(acc_profits, label='Cumulative Profit')
+axs[1].set_xlabel('Round')
+axs[1].set_ylabel('Value')
+axs[1].legend()
+axs[1].set_title('Accumulated Profit Over Time')
 
 
 # Set the main title for the figure
@@ -186,3 +251,24 @@ plt.tight_layout(rect=[0, 0, 1, 0.95])
 
 # Display the plot
 plt.show()
+
+
+
+# Evaluation metrics for linear and sublinear fits
+mse_linear = mean_squared_error(regrets, regret_linear_fit)
+rmse_linear = np.sqrt(mse_linear)
+r2_linear = r2_score(regrets, regret_linear_fit)
+
+mse_sublinear1 = mean_squared_error(regrets, regret_sublinear_23_fit)
+rmse_sublinear1 = np.sqrt(mse_sublinear1)
+r2_sublinear1 = r2_score(regrets, regret_sublinear_23_fit)
+
+mse_sublinear2 = mean_squared_error(regrets, regret_sublinear_12_fit)
+rmse_sublinear2 = np.sqrt(mse_sublinear2)
+r2_sublinear2 = r2_score(regrets, regret_sublinear_12_fit)
+
+
+# Print out the results
+print(f"Linear Fit: MSE = {mse_linear:.3f}, RMSE = {rmse_linear:.3f}, R^2 = {r2_linear:.3f}")
+print(f"Sublinear (t^(2/3)) Fit: MSE = {mse_sublinear1:.3f}, RMSE = {rmse_sublinear1:.3f}, R^2 = {r2_sublinear1:.3f}")
+print(f"Sublinear (t^(1/2)) Fit: MSE = {mse_sublinear2:.3f}, RMSE = {rmse_sublinear2:.3f}, R^2 = {r2_sublinear2:.3f}")
